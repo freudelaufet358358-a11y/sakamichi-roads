@@ -1,0 +1,73 @@
+# 道路データを作って GitHub Pages に置く（毎月 1 日と、手動の「Run workflow」で）
+name: build road data
+
+on:
+  schedule:
+    # 毎月 1 日 18:00 UTC（日本時間 2 日 3:00）
+    - cron: "0 18 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  # Geofabrik の地域（https://download.geofabrik.de/asia/japan.html）。増やすときは空白で区切って足す
+  REGIONS: chugoku
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          pip install "osmium>=3.7,<5"
+
+      - name: Download OSM data
+        run: |
+          mkdir -p data
+          for r in $REGIONS; do
+            curl -fsSL -o "data/$r.osm.pbf" "https://download.geofabrik.de/asia/japan/$r-latest.osm.pbf"
+            curl -fsSL -o "data/$r.poly" "https://download.geofabrik.de/asia/japan/$r.poly"
+          done
+          ls -la data
+
+      - name: Build cells
+        run: |
+          for r in $REGIONS; do
+            # 道と、信号・名前の付いた交差点だけにする（道の点も一緒に残る）
+            osmium tags-filter "data/$r.osm.pbf" w/highway n/highway=traffic_signals n/junction=yes -o "data/$r-roads.osm.pbf" --overwrite
+            python build_cells.py "data/$r-roads.osm.pbf" --poly "data/$r.poly" --out "site/$r" --source "$r"
+          done
+          python merge_meta.py site $REGIONS
+          cp README.md site/README.md
+          touch site/.nojekyll
+          du -sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
