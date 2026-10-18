@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
-"""坂道サイクルマップ用の道路データ（区画ごとの JSON）を、OSM の地域データ（.osm.pbf）から作る。
+"""坂道サイクルマップ用の道路データ（区画ごとのファイル）を、OSM の地域データ（.osm.pbf）から作る。
 
 アプリは道路データを「区画」（緯度 0.03° × 経度 0.04°）ごとに読み込む。これまでは Overpass API から
-取っていたが遅いので、同じ形の JSON を前もって作っておき、GitHub Pages から配る。
+取っていたが遅いので、前もって作っておき、GitHub Pages から配る。
 
-出力（--out の下）:
-  cells/{i}_{j}.z     道（way）と、その点（node）と信号（id だけの node）。Overpass の結果をアプリが
-                      区画に分けたものと同じ形の JSON・同じ分け方（区画を通る道は、その区画のファイルに入る）
-  names/{i}_{j}.z     名前の付いた信号・交差点（案内で「◯◯交差点を右」と言うため）
-                      どちらも JSON を raw DEFLATE で縮めたもの（GitHub Pages の 1 GB に収めるため。約 1/6 になる）
-  meta.json           作った日時と、配っている区画の一覧（地域の境界の中に丸ごと入る区画だけ。
-                      境界にかかる区画は、境界の外の道が抜けるので配らない → アプリは Overpass から取る）
+全国は 1 回で読むとメモリが足りないので、地方ごと（Geofabrik の地域）に 2 段階で作る:
+  1. extract: 地方の .osm.pbf から、その地方の道が通る区画ごとの中間ファイルを作る（work/{地方}/）
+  2. merge:   全地方の中間ファイルを区画ごとに合わせる（地方の境目の区画は、両方の地方の道を合わせると欠けがなくなる）。
+              日本全体の境界（japan.poly）の中に丸ごと入る区画を配る
+
+出力（merge の --out の下）:
+  {名前}/cells/{i}_{j}.b  道（way）と、その点（node）と信号。下の「区画のファイルの形」を raw DEFLATE で縮めたもの
+  {名前}/names/{i}_{j}.z  名前の付いた信号・交差点（案内で「◯◯交差点を右」と言うため）。JSON を raw DEFLATE で縮めたもの
+  meta.json               作った日時と、配っている区画（行ごとの範囲）。道の無い区画（海など）はファイルを置かない
+                          → アプリは、配っている区画でファイルが無ければ「道なし」とみなす
+
+区画のファイルの形（SKC1。数は可変長、差分は zigzag の可変長）:
+  "SKC1"
+  文字列の数, (長さ, UTF-8)…                         タグのキー・値
+  点の数, (id の差分, 緯度の差分, 経度の差分)…          緯度・経度は 1e-7 度の整数。差分は前の点から
+  道の数, (id の差分, 点の数, (点の番号の差分)…, タグの数, (キーの番号, 値の番号)…)…
+  信号の数, (点の番号の差分)…
 
 使い方:
-  osmium tags-filter region.osm.pbf w/highway n/highway=traffic_signals n/junction=yes -o roads.osm.pbf
-  python build_cells.py roads.osm.pbf --poly region.poly --out site --source chugoku
+  osmium tags-filter chugoku.osm.pbf w/highway n/highway=traffic_signals n/junction=yes -o chugoku-roads.osm.pbf
+  python build_cells.py extract chugoku-roads.osm.pbf --out work/chugoku
+  python build_cells.py merge --poly japan.poly --work work --out site --name japan chugoku kansai …
 """
 
 import argparse
 import array
+import bisect
 import datetime
 import json
 import math
@@ -75,12 +87,22 @@ def keep_way(tags):
     return True
 
 
-# MARK: - 地域の境界（Geofabrik の .poly）
+def deflate(data, level=9):
+    """raw DEFLATE（ヘッダーなし）。iOS の NSData.decompressed(using: .zlib) でそのまま戻せる形"""
+    c = zlib.compressobj(level, zlib.DEFLATED, -15)
+    return c.compress(data) + c.flush()
+
+
+def inflate(data):
+    return zlib.decompress(data, -15)
+
+
+# MARK: - 境界（Geofabrik の .poly）
 
 
 def read_poly(path):
-    """外側の輪と穴（! で始まる輪）。座標は (lon, lat)"""
-    rings, holes = [], []
+    """輪（外側も穴も。中か外かは偶奇で決める）。座標は (lon, lat)"""
+    rings = []
     with open(path, encoding="utf-8") as f:
         lines = [l.strip() for l in f]
     i = 1  # 1 行目は名前
@@ -96,138 +118,186 @@ def read_poly(path):
                 ring.append((float(parts[0]), float(parts[1])))
             i += 1
         i += 1
-        (holes if name.startswith("!") else rings).append(ring)
-    return rings, holes
+        rings.append(ring)
+    return rings
 
 
-def point_in_ring(x, y, ring):
-    inside = False
-    n = len(ring)
-    j = n - 1
-    for k in range(n):
-        xi, yi = ring[k]
-        xj, yj = ring[j]
-        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
-            inside = not inside
-        j = k
-    return inside
+def covered_cells(rings):
+    """境界の中に丸ごと入る区画。境界の線が通る区画（とその隣）を除き、残りは区画の真ん中が中にあるかで決める。
+    区画を 1 つずつ境界と比べると全国では遅すぎるので、行ごとに境界の線との交点を求めて数える"""
+    edges = [(r[k - 1], r[k]) for r in rings for k in range(len(r))]
+    # 境界の線が通る区画（線の上を 1/4 区画ごとにたどり、念のため隣の区画も）
+    boundary = set()
+    for (x0, y0), (x1, y1) in edges:
+        n = max(1, math.ceil(max(abs(x1 - x0) / (CELL_LON / 4), abs(y1 - y0) / (CELL_LAT / 4))))
+        for t in range(n + 1):
+            f = t / n
+            i, j = cell_of(y0 + (y1 - y0) * f, x0 + (x1 - x0) * f)
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    boundary.add((i + di, j + dj))
+    ys = [p[1] for r in rings for p in r]
+    xs = [p[0] for r in rings for p in r]
+    i0, j0 = cell_of(min(ys), min(xs))
+    i1, j1 = cell_of(max(ys), max(xs))
+    out = []
+    for i in range(i0, i1 + 1):
+        y = (i + 0.5) * CELL_LAT
+        cross = sorted(x0 + (y - y0) * (x1 - x0) / (y1 - y0) for (x0, y0), (x1, y1) in edges if (y0 > y) != (y1 > y))
+        for j in range(j0, j1 + 1):
+            if (i, j) in boundary:
+                continue
+            if bisect.bisect_left(cross, (j + 0.5) * CELL_LON) % 2 == 1:
+                out.append((i, j))
+    return out
 
 
-def segments_cross(a, b, c, d):
-    def orient(p, q, r):
-        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
-
-    o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
-    return (o1 > 0) != (o2 > 0) and (o3 > 0) != (o4 > 0)
-
-
-class Region:
-    """区画が地域の境界の中に丸ごと入っているか"""
-
-    def __init__(self, rings, holes):
-        self.rings = rings
-        self.holes = holes
-        self.edges = []
-        for ring in rings + holes:
-            for k in range(len(ring)):
-                self.edges.append((ring[k - 1], ring[k]))
-        xs = [p[0] for r in rings for p in r]
-        ys = [p[1] for r in rings for p in r]
-        self.box = (min(ys), min(xs), max(ys), max(xs))  # s, w, n, e
-
-    def contains(self, lon, lat):
-        if not any(point_in_ring(lon, lat, r) for r in self.rings):
-            return False
-        return not any(point_in_ring(lon, lat, h) for h in self.holes)
-
-    def contains_cell(self, i, j):
-        s, w = i * CELL_LAT, j * CELL_LON
-        n, e = s + CELL_LAT, w + CELL_LON
-        corners = [(w, s), (e, s), (e, n), (w, n)]
-        if not all(self.contains(x, y) for x, y in corners):
-            return False
-        # 境界の線が区画を横切っていない・区画の中に境界の点が無い
-        sides = [(corners[k - 1], corners[k]) for k in range(4)]
-        for a, b in self.edges:
-            if w < a[0] < e and s < a[1] < n:
-                return False
-            for c, d in sides:
-                if segments_cross(a, b, c, d):
-                    return False
-        return True
-
-    def cells(self):
-        s, w, n, e = self.box
-        i0, j0 = cell_of(s, w)
-        i1, j1 = cell_of(n, e)
-        out = []
-        for i in range(i0, i1 + 1):
-            for j in range(j0, j1 + 1):
-                if self.contains_cell(i, j):
-                    out.append((i, j))
-        return out
+def rows_of(cells):
+    """区画の一覧 → 行ごとの範囲 {"1140": [始め, 終わり, 始め, 終わり, …]}（目録を小さくする）"""
+    by_row = {}
+    for i, j in sorted(cells):
+        by_row.setdefault(i, []).append(j)
+    out = {}
+    for i, js in by_row.items():
+        ranges = []
+        start = prev = js[0]
+        for j in js[1:]:
+            if j != prev + 1:
+                ranges += [start, prev]
+                start = j
+            prev = j
+        ranges += [start, prev]
+        out[str(i)] = ranges
+    return out
 
 
-# MARK: - 区画に分けて書き出す
+# MARK: - 区画のファイルの形（SKC1）
 
 
-def build(ways, signals, names, covered, out_dir, source):
-    """ways: [(id, node id の並び, 緯度の並び, 経度の並び, tags)]、signals: 信号の node id、names: [(id, lat, lon, name)]"""
-    covered = set(covered)
-    by_cell = {c: [] for c in covered}
-    for w in ways:
-        for c in touched_cells(w[2], w[3]):
-            if c in by_cell:
-                by_cell[c].append(w)
-    os.makedirs(os.path.join(out_dir, "cells"), exist_ok=True)
-    os.makedirs(os.path.join(out_dir, "names"), exist_ok=True)
-    total = 0
-    for (i, j), ws in by_cell.items():
-        elements = []
-        coords = {}
-        for wid, refs, lats, lons, tags in ws:
-            elements.append({"type": "way", "id": wid, "nodes": list(refs), "tags": tags})
-            for ref, la, lo in zip(refs, lats, lons):
-                coords[ref] = (la, lo)
-        for ref, (la, lo) in coords.items():
-            elements.append({"type": "node", "id": ref, "lat": round(la, 7), "lon": round(lo, 7)})
-        for ref in coords:
-            if ref in signals:
-                elements.append({"type": "node", "id": ref})
-        total += write_json(os.path.join(out_dir, "cells", f"{i}_{j}.z"), {"elements": elements}, deflate=True)
-
-    by_name = {c: [] for c in covered}
-    for nid, la, lo, name in names:
-        c = cell_of(la, lo)
-        if c in by_name:
-            by_name[c].append({"type": "node", "id": nid, "lat": round(la, 7), "lon": round(lo, 7), "tags": {"name": name}})
-    for (i, j), els in by_name.items():
-        total += write_json(os.path.join(out_dir, "names", f"{i}_{j}.z"), {"elements": els}, deflate=True)
-
-    meta = {
-        "version": 1,
-        "built": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": source,
-        "cellLat": CELL_LAT,
-        "cellLon": CELL_LON,
-        "cells": sorted(f"{i}_{j}" for i, j in covered),
-    }
-    write_json(os.path.join(out_dir, "meta.json"), meta)
-    return total
+def _uv(out, n):
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return
 
 
-def write_json(path, obj, deflate=False):
-    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if deflate:
-        # raw DEFLATE（ヘッダーなし）。iOS の NSData.decompressed(using: .zlib) でそのまま戻せる形
-        c = zlib.compressobj(9, zlib.DEFLATED, -15)
-        data = c.compress(data) + c.flush()
-    with open(path, "wb") as f:
-        f.write(data)
-    return len(data)
+def _sv(out, n):
+    """zigzag: 0, -1, 1, -2, 2 … → 0, 1, 2, 3, 4 …"""
+    _uv(out, -2 * n - 1 if n < 0 else 2 * n)
 
 
-# MARK: - PBF を読む（pyosmium）
+def encode_cell(ways, coords, signals):
+    """ways: [(id, [node id], tags)]、coords: {node id: (lat1e7, lon1e7)}、signals: 信号の node id の集合"""
+    ways = sorted(ways, key=lambda w: w[0])
+    order, index = [], {}
+    for _, refs, _ in ways:
+        for r in refs:
+            if r not in index:
+                index[r] = len(order)
+                order.append(r)
+    strings, sidx = [], {}
+    for _, _, tags in ways:
+        for k, v in tags.items():
+            for x in (k, v):
+                if x not in sidx:
+                    sidx[x] = len(strings)
+                    strings.append(x)
+    out = bytearray(b"SKC1")
+    _uv(out, len(strings))
+    for x in strings:
+        b = x.encode("utf-8")
+        _uv(out, len(b))
+        out += b
+    _uv(out, len(order))
+    pid = pla = plo = 0
+    for r in order:
+        la, lo = coords[r]
+        _sv(out, r - pid)
+        _sv(out, la - pla)
+        _sv(out, lo - plo)
+        pid, pla, plo = r, la, lo
+    _uv(out, len(ways))
+    pw = 0
+    for wid, refs, tags in ways:
+        _sv(out, wid - pw)
+        pw = wid
+        _uv(out, len(refs))
+        pi = 0
+        for r in refs:
+            k = index[r]
+            _sv(out, k - pi)
+            pi = k
+        _uv(out, len(tags))
+        for k, v in tags.items():
+            _uv(out, sidx[k])
+            _uv(out, sidx[v])
+    sl = sorted(index[r] for r in signals if r in index)
+    _uv(out, len(sl))
+    p = 0
+    for k in sl:
+        _uv(out, k - p)
+        p = k
+    return bytes(out)
+
+
+def decode_cell(data):
+    """encode_cell の逆 → (ways, coords, signals)"""
+    pos = 4
+
+    def uv():
+        nonlocal pos
+        n = shift = 0
+        while True:
+            b = data[pos]
+            pos += 1
+            n |= (b & 0x7F) << shift
+            shift += 7
+            if b < 0x80:
+                return n
+
+    def sv():
+        n = uv()
+        return (n >> 1) ^ -(n & 1)
+
+    assert data[:4] == b"SKC1"
+    strings = []
+    for _ in range(uv()):
+        n = uv()
+        strings.append(data[pos:pos + n].decode("utf-8"))
+        pos += n
+    ids, coords = [], {}
+    pid = pla = plo = 0
+    for _ in range(uv()):
+        pid += sv()
+        pla += sv()
+        plo += sv()
+        ids.append(pid)
+        coords[pid] = (pla, plo)
+    ways = []
+    pw = 0
+    for _ in range(uv()):
+        pw += sv()
+        refs, pi = [], 0
+        for _ in range(uv()):
+            pi += sv()
+            refs.append(ids[pi])
+        tags = {}
+        for _ in range(uv()):
+            k = strings[uv()]
+            tags[k] = strings[uv()]
+        ways.append((pw, refs, tags))
+    signals, p = set(), 0
+    for _ in range(uv()):
+        p += uv()
+        signals.add(ids[p])
+    return ways, coords, signals
+
+
+# MARK: - 1. extract: 地方の PBF → 区画ごとの中間ファイル
 
 
 def read_pbf(path):
@@ -239,6 +309,7 @@ def read_pbf(path):
             self.ways = []
             self.signals = set()
             self.names = []
+            self.tagsets = {}
 
         def node(self, n):
             hw = n.tags.get("highway")
@@ -252,38 +323,132 @@ def read_pbf(path):
             tags = {t.k: t.v for t in w.tags}
             if not keep_way(tags):
                 return
-            # 点の並びは array で持つ（地域全体の道でもメモリを食いすぎないように）
-            refs, lats, lons = array.array("q"), array.array("d"), array.array("d")
+            # 点の並びは array で持つ（地方全体の道でもメモリを食いすぎないように）。緯度・経度は 1e-7 度の整数
+            refs, lats, lons = array.array("q"), array.array("i"), array.array("i")
             for nd in w.nodes:
                 if not nd.location.valid():
                     continue
                 refs.append(nd.ref)
-                lats.append(nd.location.lat)
-                lons.append(nd.location.lon)
+                lats.append(nd.location.y)
+                lons.append(nd.location.x)
             if len(refs) < 2:
                 return
-            self.ways.append((w.id, refs, lats, lons, {k: v for k, v in tags.items() if k in KEEP_TAGS}))
+            # 同じタグの組み合わせは 1 つにまとめる（メモリを減らす）
+            kept = tuple(sorted((k, v) for k, v in tags.items() if k in KEEP_TAGS))
+            kept = self.tagsets.setdefault(kept, kept)
+            self.ways.append((w.id, refs, lats, lons, kept))
 
     h = Collector()
     h.apply_file(path, locations=True, idx="flex_mem")
     return h.ways, h.signals, h.names
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("pbf", help="道と信号・交差点だけにした .osm.pbf")
-    ap.add_argument("--poly", required=True, help="地域の境界（Geofabrik の .poly）")
-    ap.add_argument("--out", default="site", help="書き出すフォルダ")
-    ap.add_argument("--source", default="", help="meta.json に書く地域の名前")
-    args = ap.parse_args()
-
-    region = Region(*read_poly(args.poly))
-    covered = region.cells()
-    print(f"区画: {len(covered)}（境界の中に丸ごと入るもの）", flush=True)
+def extract(args):
     ways, signals, names = read_pbf(args.pbf)
     print(f"道: {len(ways)}  信号: {len(signals)}  名前の付いた交差点: {len(names)}", flush=True)
-    total = build(ways, signals, names, covered, args.out, args.source)
-    print(f"書き出し: {total / 1e6:.1f} MB → {args.out}", flush=True)
+    by_cell = {}
+    for w in ways:
+        for c in touched_cells([x / 1e7 for x in w[2]], [x / 1e7 for x in w[3]]):
+            by_cell.setdefault(c, []).append(w)
+    os.makedirs(os.path.join(args.out, "cells"), exist_ok=True)
+    os.makedirs(os.path.join(args.out, "names"), exist_ok=True)
+    for (i, j), ws in by_cell.items():
+        coords, cell_ways = {}, []
+        for wid, refs, lats, lons, tags in ws:
+            cell_ways.append((wid, list(refs), dict(tags)))
+            for r, la, lo in zip(refs, lats, lons):
+                coords[r] = (la, lo)
+        data = encode_cell(cell_ways, coords, {r for r in coords if r in signals})
+        with open(os.path.join(args.out, "cells", f"{i}_{j}.b"), "wb") as f:
+            f.write(deflate(data, 1))
+    by_name = {}
+    for nid, la, lo, name in names:
+        by_name.setdefault(cell_of(la, lo), []).append({"type": "node", "id": nid, "lat": round(la, 7), "lon": round(lo, 7), "tags": {"name": name}})
+    for (i, j), els in by_name.items():
+        with open(os.path.join(args.out, "names", f"{i}_{j}.json"), "w", encoding="utf-8") as f:
+            json.dump(els, f, ensure_ascii=False, separators=(",", ":"))
+    print(f"区画: {len(by_cell)}  名前のある区画: {len(by_name)}", flush=True)
+
+
+# MARK: - 2. merge: 全地方の中間ファイルを区画ごとに合わせる
+
+
+def merge(args):
+    covered = set(covered_cells(read_poly(args.poly)))
+    print(f"配る区画: {len(covered)}（境界の中に丸ごと入るもの。海も含む）", flush=True)
+    out = os.path.join(args.out, args.name)
+    os.makedirs(os.path.join(out, "cells"), exist_ok=True)
+    os.makedirs(os.path.join(out, "names"), exist_ok=True)
+    keys, names = {}, {}
+    for r in args.regions:
+        for f in os.listdir(os.path.join(args.work, r, "cells")):
+            keys.setdefault(f[:-2], []).append(r)
+        for f in os.listdir(os.path.join(args.work, r, "names")):
+            names.setdefault(f[:-5], []).append(r)
+    total = files = 0
+    for key, regions in keys.items():
+        i, j = map(int, key.split("_"))
+        if (i, j) not in covered:
+            continue
+        ways, coords, signals = {}, {}, set()
+        for r in regions:
+            with open(os.path.join(args.work, r, "cells", key + ".b"), "rb") as f:
+                ws, cs, ss = decode_cell(inflate(f.read()))
+            for w in ws:
+                ways.setdefault(w[0], w)  # 地方の境目の道は両方に入っている: 1 本に
+            coords.update(cs)
+            signals |= ss
+        data = deflate(encode_cell(list(ways.values()), coords, signals))
+        with open(os.path.join(out, "cells", key + ".b"), "wb") as f:
+            f.write(data)
+        total += len(data)
+        files += 1
+    for key, regions in names.items():
+        i, j = map(int, key.split("_"))
+        if (i, j) not in covered:
+            continue
+        els = {}
+        for r in regions:
+            with open(os.path.join(args.work, r, "names", key + ".json"), encoding="utf-8") as f:
+                for e in json.load(f):
+                    els[e["id"]] = e
+        data = deflate(json.dumps({"elements": list(els.values())}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        with open(os.path.join(out, "names", key + ".z"), "wb") as f:
+            f.write(data)
+        total += len(data)
+        files += 1
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta = {
+        "version": 2,
+        "built": now,
+        "format": "skc1",
+        "cellLat": CELL_LAT,
+        "cellLon": CELL_LON,
+        "sources": args.regions,
+        "regions": {args.name: {"built": now, "rows": rows_of(covered)}},
+    }
+    with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, separators=(",", ":"))
+    print(f"書き出し: {files} ファイル {total / 1e6:.1f} MB → {out}", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    e = sub.add_parser("extract", help="地方の .osm.pbf → 区画ごとの中間ファイル")
+    e.add_argument("pbf", help="道と信号・交差点だけにした .osm.pbf")
+    e.add_argument("--out", required=True, help="中間ファイルのフォルダ（work/{地方}）")
+    m = sub.add_parser("merge", help="中間ファイルを合わせて、配るファイルと meta.json を作る")
+    m.add_argument("regions", nargs="+", help="合わせる地方（work の下のフォルダ名）")
+    m.add_argument("--poly", required=True, help="配る範囲の境界（Geofabrik の .poly。全国なら japan.poly）")
+    m.add_argument("--work", default="work")
+    m.add_argument("--out", default="site")
+    m.add_argument("--name", default="japan", help="配るフォルダの名前（site/{名前}/cells/…）")
+    args = ap.parse_args()
+    if args.cmd == "extract":
+        extract(args)
+    else:
+        merge(args)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# 道路データを作って GitHub Pages に置く（毎月 1 日と、手動の「Run workflow」で）
+# 道路データ（日本全国）を作って GitHub Pages に置く（毎月 1 日と、手動の「Run workflow」で）
 name: build road data
 
 on:
@@ -17,13 +17,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Geofabrik の地域（https://download.geofabrik.de/asia/japan.html）。増やすときは空白で区切って足す
-  REGIONS: chugoku
+  # Geofabrik の日本の地方（https://download.geofabrik.de/asia/japan.html）。全国を 1 回で読むとメモリが足りないので地方ごとに作り、最後に合わせる
+  REGIONS: hokkaido tohoku kanto chubu kansai chugoku shikoku kyushu
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
 
@@ -37,23 +37,26 @@ jobs:
           sudo apt-get install -y osmium-tool
           pip install "osmium>=3.7,<5"
 
-      - name: Download OSM data
+      - name: Extract each region
         run: |
-          mkdir -p data
+          mkdir -p data work
+          curl -fsSL -o data/japan.poly "https://download.geofabrik.de/asia/japan.poly"
           for r in $REGIONS; do
+            echo "::group::$r"
             curl -fsSL -o "data/$r.osm.pbf" "https://download.geofabrik.de/asia/japan/$r-latest.osm.pbf"
-            curl -fsSL -o "data/$r.poly" "https://download.geofabrik.de/asia/japan/$r.poly"
-          done
-          ls -la data
-
-      - name: Build cells
-        run: |
-          for r in $REGIONS; do
             # 道と、信号・名前の付いた交差点だけにする（道の点も一緒に残る）
             osmium tags-filter "data/$r.osm.pbf" w/highway n/highway=traffic_signals n/junction=yes -o "data/$r-roads.osm.pbf" --overwrite
-            python build_cells.py "data/$r-roads.osm.pbf" --poly "data/$r.poly" --out "site/$r" --source "$r"
+            rm "data/$r.osm.pbf"
+            python build_cells.py extract "data/$r-roads.osm.pbf" --out "work/$r"
+            rm "data/$r-roads.osm.pbf"
+            echo "::endgroup::"
           done
-          python merge_meta.py site $REGIONS
+          df -h .
+
+      - name: Merge into cells
+        run: |
+          python build_cells.py merge --poly data/japan.poly --work work --out site --name japan $REGIONS
+          rm -rf work
           cp README.md site/README.md
           touch site/.nojekyll
           du -sh site
