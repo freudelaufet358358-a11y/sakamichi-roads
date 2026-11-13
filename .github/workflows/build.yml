@@ -58,6 +58,7 @@ jobs:
           python build_cells.py merge --poly data/japan.poly --work work --out site --name japan $REGIONS
           rm -rf work
           cp README.md site/README.md
+          cp pages/*.html pages/*.css site/
           touch site/.nojekyll
           du -sh site
 
